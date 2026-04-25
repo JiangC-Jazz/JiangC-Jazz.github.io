@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>IoT管理系统 - 2.0</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <script src="https://unpkg.com/vue@3"></script>
+    <script src="https://unpkg.com/element-plus"></script>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: sans-serif; background-color: #f4f6f9; }
+        #app { height: 100%; }
+        .top-header { height: 60px; background: #fff; display: flex; justify-content: space-between; align-items: center; padding: 0 30px; border-bottom: 1px solid #dcdfe6; }
+        .user-info { display: flex; align-items: center; cursor: pointer; gap: 10px; }
+        .avatar { width: 35px; height: 35px; background: #409EFF; color: #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; }
+        .main-layout { display: flex; height: calc(100vh - 60px); gap: 10px; padding: 10px; box-sizing: border-box; }
+        .left-panel { flex: 1; display: flex; flex-direction: column; gap: 10px; }
+        .left-top, .left-bottom { background: #fff; border-radius: 8px; border: 1px solid #dcdfe6; padding: 15px; overflow-y: auto; }
+        .left-top { flex: 2; } .left-bottom { flex: 1; }
+        .right-container { flex: 2; display: flex; flex-direction: column; gap: 10px; }
+        .top-right { flex: 0.8; background: #fff; border-radius: 8px; border: 1px solid #dcdfe6; padding: 15px; }
+        .bottom-right { flex: 3.2; background: #fff; border-radius: 8px; border: 1px solid #dcdfe6; padding: 20px; }
+        .login-container { width: 400px; margin: 100px auto; }
+
+        /* --- 新增：列表特性样式 --- */
+        /* 1. 搜索不匹配时整行透明度变低 */
+        .is-faded {
+            opacity: 0.2;
+            filter: grayscale(100%);
+            transition: all 0.3s ease;
+        }
+        /* 2. 管理员看到的已删除行样式 */
+        .deleted-row {
+            background-color: #f5f7fa !important;
+            color: #c0c4cc !important;
+        }
+    </style>
+</head>
+<body>
+<div id="app">
+    <div v-if="!currentUser" class="login-container">
+        <el-tabs type="border-card" v-model="activeTab">
+            <el-tab-pane label="登录" name="login">
+                <el-form label-width="60px">
+                    <el-form-item label="账号"><el-input v-model="loginForm.name"></el-input></el-form-item>
+                    <el-form-item label="密码"><el-input type="password" v-model="loginForm.pass" show-password></el-input></el-form-item>
+                    <el-button type="primary" @click="handleLogin" style="width:100%">进入系统</el-button>
+                </el-form>
+            </el-tab-pane>
+            <el-tab-pane label="注册用户" name="reg">
+                <el-form label-width="60px">
+                    <el-form-item label="账号"><el-input v-model="regForm.name"></el-input></el-form-item>
+                    <el-form-item label="密码"><el-input type="password" v-model="regForm.pass" show-password></el-input></el-form-item>
+                    <el-button type="success" @click="handleRegister" style="width:100%">提交注册</el-button>
+                </el-form>
+            </el-tab-pane>
+        </el-tabs>
+    </div>
+
+    <template v-else>
+        <div class="top-header">
+            <div>
+                <el-tag :type="mqttConnected ? 'success' : 'danger'" size="small">
+                    MQTT服务器: {{ mqttConnected ? '已连接' : '未连接' }}
+                </el-tag>
+            </div>
+            <div class="user-info">
+                <span>{{ currentUser.name }} ({{ userRole === 'admin' ? '管理员' : '用户' }})</span>
+                <el-dropdown trigger="click">
+                    <div class="avatar">{{ currentUser.name.charAt(0).toUpperCase() }}</div>
+                    <template #dropdown>
+                        <el-dropdown-menu>
+                            <el-dropdown-item @click="logout">切换账号</el-dropdown-item>
+                        </el-dropdown-menu>
+                    </template>
+                </el-dropdown>
+            </div>
+        </div>
+
+        <div class="main-layout">
+            <div class="left-panel">
+                <div class="left-top">
+                    <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom:10px;">
+                        <span><b>设备监控列表</b></span>
+                        <el-button v-if="userRole === 'user'" type="primary" size="small" @click="showAddDevice = true">+ 添加设备</el-button>
+                    </div>
+                    <el-table :data="sortedDevices" @row-click="selectDevice" :row-class-name="getRowClass" highlight-current-row size="small" border>
+                        <el-table-column prop="id" label="编号"></el-table-column>
+                        <el-table-column prop="location" label="位置"></el-table-column>
+                        <el-table-column prop="status" label="状态" width="80">
+                            <template #default="scope">
+                                <span v-if="scope.row.isDeleted" style="color:#f56c6c; font-size: 12px;">已注销</span>
+                                <el-tag v-else :type="scope.row.status === '正常' ? 'success' : 'info'" size="small">
+                                    {{ scope.row.status }}
+                                </el-tag>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                </div>
+                <div v-if="userRole === 'admin'" class="left-bottom">
+                    <b>用户管理 (按属主筛选)</b>
+                    <el-table :data="users" size="small" @row-click="row => ownerFilter = row.name">
+                        <el-table-column prop="name" label="用户名"></el-table-column>
+                        <el-table-column label="操作" width="60">
+                            <template #default><el-button link type="primary" @click.stop="ownerFilter = ''">全部</el-button></template>
+                        </el-table-column>
+                    </el-table>
+                </div>
+            </div>
+
+            <div class="right-container">
+                <div class="top-right">
+                    <b>搜索与过滤</b>
+                    <el-input v-model="searchQuery" placeholder="搜索编号或位置 (不匹配项将自动淡化)..." style="margin-top:10px" clearable></el-input>
+                </div>
+                <div class="bottom-right">
+                    <div v-if="selectedDevice">
+                        <h3>详情：{{selectedDevice.id}}</h3>
+                        <el-descriptions :column="1" border>
+                            <el-descriptions-item label="安装位置">{{selectedDevice.location}}</el-descriptions-item>
+                            <el-descriptions-item label="所有者">{{selectedDevice.owner}}</el-descriptions-item>
+                            <el-descriptions-item label="实时数据">
+                                <b style="color: #409EFF">{{selectedDevice.data || '等待信号上报...'}}</b>
+                            </el-descriptions-item>
+
+                            <el-descriptions-item label="远程开关">
+                                <el-switch
+                                        v-model="selectedDevice.relay"
+                                        @change="sendControl"
+                                        :disabled="selectedDevice.isDeleted"
+                                        active-text="开启"
+                                        inactive-text="关闭">
+                                </el-switch>
+                            </el-descriptions-item>
+                        </el-descriptions>
+
+                        <div style="margin-top:20px" v-if="userRole === 'user' && !selectedDevice.isDeleted">
+                            <el-button type="danger" plain @click="deleteDevice">删除并注销设备</el-button>
+                        </div>
+                        <div v-if="selectedDevice.isDeleted" style="margin-top:10px">
+                            <el-alert title="该设备已被注销，无法进行控制操作" type="info" show-icon :closable="false"></el-alert>
+                        </div>
+                    </div>
+                    <el-empty v-else description="请从左侧选择一台设备"></el-empty>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <el-dialog v-model="showAddDevice" title="新增设备录入" width="400px">
+        <el-form label-width="80px">
+            <el-form-item label="设备编号"><el-input v-model="newDevice.id" placeholder="如: DEV-001"></el-input></el-form-item>
+            <el-form-item label="物理位置"><el-input v-model="newDevice.location"></el-input></el-form-item>
+        </el-form>
+        <template #footer>
+            <el-button @click="showAddDevice = false">取消</el-button>
+            <el-button type="primary" @click="confirmAdd">确认添加</el-button>
+        </template>
+    </el-dialog>
+</div>
+
+<script>
+    const { createApp, ref, computed, watch } = Vue;
+    createApp({
+        setup() {
+            const activeTab = ref('login');
+            const currentUser = ref(null);
+            const userRole = ref('');
+            const loginForm = ref({ name: '', pass: '' });
+            const regForm = ref({ name: '', pass: '' });
+            const searchQuery = ref('');
+            const selectedDevice = ref(null);
+            const ownerFilter = ref('');
+            const showAddDevice = ref(false);
+            const newDevice = ref({ id: '', location: '' });
+
+            const mqttConnected = ref(false);
+            const client = ref(null);
+
+            // 数据持久化
+            const users = ref(JSON.parse(localStorage.getItem('iot_users') || '[]'));
+            const devices = ref(JSON.parse(localStorage.getItem('iot_devices') || '[]'));
+            watch(devices, (val) => localStorage.setItem('iot_devices', JSON.stringify(val)), { deep: true });
+            watch(users, (val) => localStorage.setItem('iot_users', JSON.stringify(val)), { deep: true });
+
+            const initMqtt = () => {
+                const url = 'wss://g53713b0.ala.cn-hangzhou.emqxsl.cn:8084/mqtt';
+                const options = {
+                    username: 'JiangC',
+                    password: 'Hhh9bgsn',
+                    clientId: 'web_' + Math.random().toString(16).substring(2, 8),
+                    clean: true
+                };
+                client.value = mqtt.connect(url, options);
+                client.value.on('connect', () => {
+                    mqttConnected.value = true;
+                    client.value.subscribe('iot/devices/+/data');
+                });
+                client.value.on('disconnect', () => { mqttConnected.value = false; });
+                client.value.on('message', (topic, message) => {
+                    try {
+                        const payload = JSON.parse(message.toString());
+                        const deviceId = topic.split('/')[2];
+                        const dev = devices.value.find(d => d.id === deviceId);
+                        if (dev) {
+                            dev.status = '正常';
+                            dev.data = payload.val || '无数据';
+                            if(payload.relay !== undefined) dev.relay = payload.relay === 1;
+                        }
+                    } catch (e) { console.error('Data Error'); }
+                });
+            };
+
+            const sendControl = (val) => {
+                if (!selectedDevice.value || !mqttConnected.value) return;
+                const topic = `iot/devices/${selectedDevice.value.id}/control`;
+                client.value.publish(topic, JSON.stringify({ cmd: 'relay', value: val ? 1 : 0 }));
+                ElementPlus.ElMessage.success('指令已发送');
+            };
+
+            const handleLogin = () => {
+                let found = null;
+                if (loginForm.value.name === 'admin' && loginForm.value.pass === '123') {
+                    userRole.value = 'admin';
+                    found = { name: 'admin' };
+                } else {
+                    const u = users.value.find(u => u.name === loginForm.value.name && u.pass === loginForm.value.pass);
+                    if (u) { userRole.value = 'user'; found = u; }
+                    else { alert('失败'); return; }
+                }
+                currentUser.value = found;
+                initMqtt();
+            };
+
+            const handleRegister = () => {
+                users.value.push({ ...regForm.value });
+                regForm.value = { name: '', pass: '' };
+                activeTab.value = 'login';
+                alert('注册成功');
+            };
+
+            const confirmAdd = () => {
+                if(!newDevice.value.id) return;
+                devices.value.push({
+                    ...newDevice.value,
+                    owner: currentUser.value.name,
+                    status: '离线', data: '', relay: false, isDeleted: false
+                });
+                showAddDevice.value = false;
+                newDevice.value = { id: '', location: '' };
+            };
+
+            // --- 核心改动：计算属性逻辑 ---
+            const sortedDevices = computed(() => {
+                // 1. 权限过滤：用户只看自己的且未注销的；管理员看全部
+                let list = [];
+                if (userRole.value === 'admin') {
+                    list = devices.value.map(d => ({ ...d }));
+                } else {
+                    list = devices.value.filter(d => d.owner === currentUser.value.name && !d.isDeleted);
+                }
+
+                // 2. 筛选属主 (管理员功能)
+                if (ownerFilter.value) {
+                    list = list.filter(d => d.owner === ownerFilter.value);
+                }
+
+                // 3. 排序逻辑：在“非搜索模式”下，已注销设备置底 (仅管理员会看到注销设备)
+                if (!searchQuery.value && userRole.value === 'admin') {
+                    list.sort((a, b) => (a.isDeleted === b.isDeleted ? 0 : a.isDeleted ? 1 : -1));
+                }
+
+                // 4. 搜索匹配逻辑：不剔除，只标记 isMatch
+                const q = searchQuery.value.toLowerCase().trim();
+                return list.map(d => {
+                    const match = !q || d.id.toLowerCase().includes(q) || d.location.toLowerCase().includes(q);
+                    return { ...d, isMatch: match };
+                });
+            });
+
+            // --- 核心改动：样式判定函数 ---
+            const getRowClass = ({ row }) => {
+                let classNames = [];
+                if (!row.isMatch) classNames.push('is-faded'); // 搜索不匹配褪色
+                if (row.isDeleted) classNames.push('deleted-row'); // 已注销变灰
+                return classNames.join(' ');
+            };
+
+            const deleteDevice = () => {
+                const dev = devices.value.find(d => d.id === selectedDevice.value.id);
+                if (dev) {
+                    dev.isDeleted = true; // 软删除标记
+                    selectedDevice.value = null;
+                    ElementPlus.ElMessage.warning('设备已成功从您的列表中注销');
+                }
+            };
+
+            return {
+                activeTab, currentUser, userRole, loginForm, regForm, searchQuery,
+                selectedDevice, users, devices, sortedDevices, showAddDevice, newDevice,
+                mqttConnected, getRowClass, deleteDevice, handleLogin, handleRegister, confirmAdd,
+                logout: () => { location.reload(); },
+                selectDevice: (row) => selectedDevice.value = row,
+                sendControl
+            };
+        }
+    }).use(ElementPlus).mount('#app');
+</script>
+</body>
+</html>
